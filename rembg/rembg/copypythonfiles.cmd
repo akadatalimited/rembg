@@ -1,0 +1,1 @@
+docker cp d:\rembg\rembg\ 7806d5cacc7a:/usr/local/lib/python3.10/dist-packages/
