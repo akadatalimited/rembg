@@ -6,9 +6,15 @@ import onnxruntime as ort
 from PIL import Image
 from PIL.Image import Image as PILImage
 
+import cupy as cp  # For GPU operations
+
+import asyncio  # Import asyncio for parallel processing
+from concurrent.futures import ThreadPoolExecutor
 
 class BaseSession:
-    """This is a base class for managing a session with a machine learning model."""
+    """This is a base class for managing a session with a machine learning model.
+    Forked by AKADATA LIMITED and enhanced by Andrew Smalley.
+    """
 
     def __init__(
         self,
@@ -23,14 +29,14 @@ class BaseSession:
 
         self.providers = []
 
-        _providers = ort.get_available_providers()
-        if providers:
-            for provider in providers:
-                if provider in _providers:
-                    self.providers.append(provider)
-        else:
-            self.providers.extend(_providers)
+        # Add CUDA provider first for GPU acceleration
+        if ort.get_available_providers():
+            if "CUDAExecutionProvider" in ort.get_available_providers():
+                self.providers.append("CUDAExecutionProvider")
+            else:
+                self.providers.extend(ort.get_available_providers())
 
+        # Create Inference Session with prioritized CUDA provider
         self.inner_session = ort.InferenceSession(
             str(self.__class__.download_models(*args, **kwargs)),
             providers=self.providers,
@@ -46,12 +52,13 @@ class BaseSession:
         *args,
         **kwargs
     ) -> Dict[str, np.ndarray]:
+        # Convert the image and move to GPU
         im = img.convert("RGB").resize(size, Image.Resampling.LANCZOS)
 
-        im_ary = np.array(im)
-        im_ary = im_ary / np.max(im_ary)
+        # Move normalization to GPU using CuPy
+        im_ary = cp.asarray(im) / 255.0
 
-        tmpImg = np.zeros((im_ary.shape[0], im_ary.shape[1], 3))
+        tmpImg = cp.zeros((im_ary.shape[0], im_ary.shape[1], 3), dtype=cp.float32)
         tmpImg[:, :, 0] = (im_ary[:, :, 0] - mean[0]) / std[0]
         tmpImg[:, :, 1] = (im_ary[:, :, 1] - mean[1]) / std[1]
         tmpImg[:, :, 2] = (im_ary[:, :, 2] - mean[2]) / std[2]
@@ -60,12 +67,56 @@ class BaseSession:
 
         return {
             self.inner_session.get_inputs()[0]
-            .name: np.expand_dims(tmpImg, 0)
-            .astype(np.float32)
+            .name: cp.expand_dims(tmpImg, 0)
+            .astype(cp.float32)
+            .get()  # Convert back to numpy to be used by ONNX Runtime
         }
+
+    def predict_batch(self, imgs: List[PILImage], *args, **kwargs) -> List[List[PILImage]]:
+        """
+        Predict the output masks for a batch of input images.
+
+        Parameters:
+            imgs (List[PILImage]): A list of input images.
+
+        Returns:
+            List[List[PILImage]]: A list of lists containing output masks for each input image.
+        """
+        inputs = [self.normalize(img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), (1024, 1024)) for img in imgs]
+        ort_outs = [self.inner_session.run(None, input) for input in inputs]
+        
+        results = []
+        for img, ort_out in zip(imgs, ort_outs):
+            pred = self.sigmoid(ort_out[0][:, 0, :, :])
+            ma = cp.max(pred)
+            mi = cp.min(pred)
+            pred = (pred - mi) / (ma - mi)
+            pred = cp.squeeze(pred)
+            mask = Image.fromarray((pred.get() * 255).astype("uint8"), mode="L")
+            results.append([mask.resize(img.size, Image.Resampling.LANCZOS)])
+
+        return results
+
+    def sigmoid(self, mat):
+        """
+        Apply the sigmoid function to the given matrix.
+        
+        Parameters:
+            mat (cp.ndarray): The input matrix.
+        
+        Returns:
+            cp.ndarray: The result after applying the sigmoid function.
+        """
+        return 1 / (1 + cp.exp(-mat))
 
     def predict(self, img: PILImage, *args, **kwargs) -> List[PILImage]:
         raise NotImplementedError
+
+    async def predict_async(self, img: PILImage, *args, **kwargs) -> List[PILImage]:
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            result = await loop.run_in_executor(pool, self.predict, img, *args, **kwargs)
+        return result
 
     @classmethod
     def checksum_disabled(cls, *args, **kwargs):

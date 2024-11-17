@@ -2,6 +2,7 @@ import os
 from typing import List
 
 import numpy as np
+import cupy as cp  # Added cupy for GPU operations
 import pooch
 from PIL import Image
 from PIL.Image import Image as PILImage

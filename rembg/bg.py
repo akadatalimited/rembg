@@ -2,8 +2,13 @@ import io
 from enum import Enum
 from typing import Any, List, Optional, Tuple, Union, cast
 
+import logging
+
+import asyncio
+
 import numpy as np
 import onnxruntime as ort
+import cv2
 from cv2 import (
     BORDER_DEFAULT,
     MORPH_ELLIPSE,
@@ -12,6 +17,12 @@ from cv2 import (
     getStructuringElement,
     morphologyEx,
 )
+
+from scipy.ndimage import label
+from skimage import morphology
+
+
+
 from PIL import Image, ImageOps
 from PIL.Image import Image as PILImage
 from pymatting.alpha.estimate_alpha_cf import estimate_alpha_cf
@@ -151,17 +162,49 @@ def get_concat_v(img1: PILImage, img2: PILImage) -> PILImage:
     return dst
 
 
+
 def post_process(mask: np.ndarray) -> np.ndarray:
+    """
+    Post-process the binary mask to smooth boundaries and remove noise using
+    Morphological Operations and Otsu's thresholding.
+    
+    Args:
+        mask (np.ndarray): Binary Numpy Mask (0 and 255)
+        
+    Returns:
+        np.ndarray: Post-processed binary mask
+    """
+    # Define the structuring element for morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # You can adjust the size as needed
+
+    # Step 1: Morphological Opening to remove small noise
+    mask = morphologyEx(mask, MORPH_OPEN, kernel)
+
+    # Step 2: Gaussian Blurring to smooth the boundaries
+    mask = GaussianBlur(mask, (5, 5), sigmaX=2, sigmaY=2, borderType=BORDER_DEFAULT)
+
+    # Step 3: Otsu's Thresholding to convert back to binary mask
+    _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    return mask
+
+
+def x_post_process(mask: np.ndarray) -> np.ndarray:
     """
     Post Process the mask for a smooth boundary by applying Morphological Operations
     Research based on paper: https://www.sciencedirect.com/science/article/pii/S2352914821000757
     args:
         mask: Binary Numpy Mask
     """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # or 3,3 default
     mask = morphologyEx(mask, MORPH_OPEN, kernel)
     mask = GaussianBlur(mask, (5, 5), sigmaX=2, sigmaY=2, borderType=BORDER_DEFAULT)
     mask = np.where(mask < 127, 0, 255).astype(np.uint8)  # type: ignore
     return mask
+
+
+
+
 
 
 def apply_background_color(img: PILImage, color: Tuple[int, int, int, int]) -> PILImage:
@@ -203,7 +246,9 @@ def download_models() -> None:
         session.download_models()
 
 
-def remove(
+
+# Add async support in remove function
+async def remove_async(
     data: Union[bytes, PILImage, np.ndarray],
     alpha_matting: bool = False,
     alpha_matting_foreground_threshold: int = 240,
@@ -218,26 +263,7 @@ def remove(
     **kwargs: Optional[Any]
 ) -> Union[bytes, PILImage, np.ndarray]:
     """
-    Remove the background from an input image.
-
-    This function takes in various parameters and returns a modified version of the input image with the background removed. The function can handle input data in the form of bytes, a PIL image, or a numpy array. The function first checks the type of the input data and converts it to a PIL image if necessary. It then fixes the orientation of the image and proceeds to perform background removal using the 'u2net' model. The result is a list of binary masks representing the foreground objects in the image. These masks are post-processed and combined to create a final cutout image. If a background color is provided, it is applied to the cutout image. The function returns the resulting cutout image in the format specified by the input 'return_type' parameter or as python bytes if force_return_bytes is true.
-
-    Parameters:
-        data (Union[bytes, PILImage, np.ndarray]): The input image data.
-        alpha_matting (bool, optional): Flag indicating whether to use alpha matting. Defaults to False.
-        alpha_matting_foreground_threshold (int, optional): Foreground threshold for alpha matting. Defaults to 240.
-        alpha_matting_background_threshold (int, optional): Background threshold for alpha matting. Defaults to 10.
-        alpha_matting_erode_size (int, optional): Erosion size for alpha matting. Defaults to 10.
-        session (Optional[BaseSession], optional): A session object for the 'u2net' model. Defaults to None.
-        only_mask (bool, optional): Flag indicating whether to return only the binary masks. Defaults to False.
-        post_process_mask (bool, optional): Flag indicating whether to post-process the masks. Defaults to False.
-        bgcolor (Optional[Tuple[int, int, int, int]], optional): Background color for the cutout image. Defaults to None.
-        force_return_bytes (bool, optional): Flag indicating whether to return the cutout image as bytes. Defaults to False.
-        *args (Optional[Any]): Additional positional arguments.
-        **kwargs (Optional[Any]): Additional keyword arguments.
-
-    Returns:
-        Union[bytes, PILImage, np.ndarray]: The cutout image with the background removed.
+    Asynchronous version of the remove function.
     """
     if isinstance(data, bytes) or force_return_bytes:
         return_type = ReturnType.BYTES
@@ -263,7 +289,8 @@ def remove(
     if session is None:
         session = new_session("u2net", *args, **kwargs)
 
-    masks = session.predict(img, *args, **kwargs)
+    # Asynchronously predict masks
+    masks = await session.predict_async(img, *args, **kwargs)
     cutouts = []
 
     for mask in masks:
@@ -313,3 +340,7 @@ def remove(
     bio.seek(0)
 
     return bio.read()
+
+# Wrapper to call async remove
+def remove(*args, **kwargs):
+    return asyncio.run(remove_async(*args, **kwargs))

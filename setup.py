@@ -37,7 +37,10 @@ extras_require = {
         "twine",
         "wheel",
     ],
-    "gpu": ["onnxruntime-gpu"],
+    "gpu": [
+            "onnxruntime-gpu"
+            "cupy-cuda12x"
+            ],
     "cli": [
         "aiohttp",
         "asyncer",
